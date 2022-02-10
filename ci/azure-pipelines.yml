@@ -1,0 +1,210 @@
+trigger:
+  batch: true
+  branches:
+    include:
+      - development
+      - testing
+      - master
+
+variables:
+  location: 'West Europe'
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # full build: install, setup and test
+          - checkout: self
+          - task: npmAuthenticate@0
+            displayName: 'npm auth .npmrc'
+            inputs:
+              workingFile: .npmrc
+
+          # install dependencies
+          - script: yarn install  && cp ./ci/$(Build.SourceBranchName).web.config ./public/web.config
+            displayName: 'yarn install'
+
+          # run tests
+          #- script: yarn test --ci --reporters=default --reporters=jest-junit
+          #  displayName: 'yarn test'
+
+          # build/update the contents
+          - script: yarn build:webpack
+            displayName: 'yarn build'
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testRunner: JUnit
+              testResultsFiles: '**/*junit.xml'
+          - task: PublishPipelineArtifact@0
+            displayName: 'publish artifact'
+            inputs:
+              artifactName: 'public'
+              targetPath: 'build'
+
+  - stage: DeployStorage
+    dependsOn: Build
+    condition: and(succeeded(),eq(variables['Build.SourceBranchName'], 'merge'))
+    jobs:
+      - deployment: DeployStorage
+        pool:
+          vmImage: 'windows-2019'
+        environment: pr
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # disable automatic download of all artifacts
+                - download: none
+                - bash: 'echo "##vso[task.setvariable variable=BRANCH]`echo "$(System.PullRequest.SourceBranch)"| cut -d/ -f3-`"'
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'public'
+                    targetPath: '$(System.ArtifactsDirectory)/public'
+                - task: AzureFileCopy@2
+                  displayName: 'Deploy to Storage'
+                  inputs:
+                    SourcePath: '$(System.ArtifactsDirectory)/public/'
+                    azureSubscription: 'azure-connection'
+                    Destination: AzureBlob
+                    storage: '$(BLOB_STORAGE)'
+                    ContainerName: '$web'
+                    BlobPrefix: '$(BRANCH)'
+                - task: YodLabs.O365PostMessage.O365PostMessageBuild.O365PostMessageBuild@0
+                  displayName: 'message webhook'
+                  condition: and(succeeded(), startsWith(variables['MESSAGE_WEBHOOK_URL'],'https://'))
+                  inputs:
+                    url: '$(MESSAGE_WEBHOOK_URL)'
+                    title: 'PR build: $(WEBAPP_BASENAME): $(BRANCH)'
+                    text: 'View at https://$(BLOB_STORAGE).z6.web.core.windows.net/$(BRANCH)/'
+
+  - stage: DeployDev
+    dependsOn: Build
+    condition: and(succeeded(),eq(variables['Build.SourceBranch'], 'refs/heads/development'))
+    jobs:
+      - deployment: DeployDevWeb
+        pool:
+          vmImage: 'windows-2019'
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # disable automatic download of all artifacts
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'public'
+                    targetPath: '$(System.ArtifactsDirectory)/public'
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Development'
+                  inputs:
+                    azureSubscription: 'azure-connection'
+                    appType: webApp
+                    appName: '$(WEBAPP_BASENAME)-nglb-dev'
+                    package: '$(System.ArtifactsDirectory)/public'
+                - task: YodLabs.O365PostMessage.O365PostMessageBuild.O365PostMessageBuild@0
+                  displayName: 'message webhook'
+                  condition: and(succeeded(), startsWith(variables['MESSAGE_WEBHOOK_URL'],'https://'))
+                  inputs:
+                    url: '$(MESSAGE_WEBHOOK_URL)'
+                    title: 'build: $(WEBAPP_BASENAME): $(Build.SourceBranch)'
+                    text: 'View at https://$(WEBAPP_BASENAME)-dev.neugelb.it'
+
+  - stage: DeployTest
+    dependsOn: Build
+    condition: and(succeeded(),eq(variables['Build.SourceBranch'], 'refs/heads/testing'))
+    jobs:
+      - deployment: DeployTestWeb
+        pool:
+          vmImage: 'windows-2019'
+        environment: test
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # disable automatic download of all artifacts
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'public'
+                    targetPath: '$(System.ArtifactsDirectory)/public'
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Testing'
+                  inputs:
+                    azureSubscription: 'azure-connection'
+                    appType: webApp
+                    appName: '$(WEBAPP_BASENAME)-nglb-test'
+                    package: '$(System.ArtifactsDirectory)/public'
+                - task: YodLabs.O365PostMessage.O365PostMessageBuild.O365PostMessageBuild@0
+                  displayName: 'message webhook'
+                  condition: and(succeeded(), startsWith(variables['MESSAGE_WEBHOOK_URL'],'https://'))
+                  inputs:
+                    url: '$(MESSAGE_WEBHOOK_URL)'
+                    title: 'build: $(WEBAPP_BASENAME): $(Build.SourceBranch)'
+                    text: 'View at https://$(WEBAPP_BASENAME).neugelb.it'
+
+  - stage: DeployProd
+    dependsOn: Build
+    condition: and(succeeded(),eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    jobs:
+      - deployment: DeployProdWeb
+        pool:
+          vmImage: 'windows-2019'
+        environment: prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # disable automatic download of all artifacts
+                - download: none
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'public'
+                    targetPath: '$(System.ArtifactsDirectory)/public'
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Production'
+                  inputs:
+                    azureSubscription: 'azure-connection'
+                    appType: webApp
+                    appName: '$(WEBAPP_BASENAME)-nglb-prod'
+                    package: '$(System.ArtifactsDirectory)/public'
+                - task: YodLabs.O365PostMessage.O365PostMessageBuild.O365PostMessageBuild@0
+                  displayName: 'message webhook'
+                  condition: and(succeeded(), startsWith(variables['MESSAGE_WEBHOOK_URL'],'https://'))
+                  inputs:
+                    url: '$(MESSAGE_WEBHOOK_URL)'
+                    title: 'build: $(WEBAPP_BASENAME): $(Build.SourceBranch)'
+                    text: 'View at PRODUCTION_URL here'
+
+  - stage: LogFailure
+    dependsOn:
+      - Build
+      - DeployStorage
+      - DeployDev
+      - DeployTest
+      - DeployProd
+    condition: failed()
+    jobs:
+      - job: FailureMessage
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: YodLabs.O365PostMessage.O365PostMessageBuild.O365PostMessageBuild@0
+            displayName: 'failure message webhook'
+            condition: startsWith(variables['MESSAGE_WEBHOOK_URL'],'https://')
+            inputs:
+              url: '$(MESSAGE_WEBHOOK_URL)'
+              title: 'failed: $(WEBAPP_BASENAME): $(Build.SourceBranch)'
+              text: 'see pipeline for details'
